@@ -31,6 +31,8 @@ extern crate alloc;
 #[cfg(feature = "dsa")]
 pub mod dsa;
 
+pub mod pke;
+
 #[cfg(feature = "arithmetic")]
 mod arithmetic;
 #[cfg(feature = "dsa")]
