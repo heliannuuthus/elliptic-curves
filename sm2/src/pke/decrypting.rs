@@ -2,15 +2,20 @@ use crate::arithmetic::field::FieldElement;
 use crate::{AffinePoint, EncodedPoint, FieldBytes, NonZeroScalar, PublicKey, Scalar, SecretKey};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use elliptic_curve::ops::Reduce;
 use elliptic_curve::sec1::FromEncodedPoint;
 use elliptic_curve::Error;
-use elliptic_curve::{bigint::U256, sec1::ToEncodedPoint, Group, Result};
+use elliptic_curve::{
+    bigint::U256,
+    sec1::{ToEncodedPoint, UncompressedPoint},
+    Group, Result,
+};
 use primeorder::PrimeField;
 use sm3::digest::DynDigest;
 use sm3::{Digest, Sm3};
 
 use super::encrypting::EncryptingKey;
-use super::{kdf, Mode};
+use super::{kdf, vec, Cipher, Mode};
 
 pub struct DecryptingKey {
     secret_scalar: NonZeroScalar,
@@ -81,9 +86,42 @@ impl DecryptingKey {
         &self.encrytingKey
     }
 
-    pub fn decrypt(&mut self, msg: &mut [u8]) -> Result<Vec<u8>> {
-        decrypt(&self.secret_scalar, self.mode, &mut *self.digest, msg)
+    /// Decrypt inplace
+    pub fn decrypt(&mut self, ciphertext: &mut [u8]) -> Result<Vec<u8>> {
+        decrypt(
+            &self.secret_scalar,
+            self.mode,
+            &mut *self.digest,
+            ciphertext,
+        )
     }
+}
+
+fn decrypt_asna1(
+    secret_scalar: &Scalar,
+    mode: Mode,
+    hasher: &mut dyn DynDigest,
+    cipher: &mut [u8],
+) -> Result<Vec<u8>> {
+    
+    let digest_size = hasher.output_size();
+    let (x, cipher) = cipher.split_at(32);
+    let (y, cipher) = cipher.split_at(32);
+    let (sm3, cipher) = match mode {
+        Mode::C1C2C3 => cipher.split_at(digest_size),
+        Mode::C1C3C2 => cipher.split_at(cipher.len() - digest_size),
+    };
+    Cipher {
+        x: x.into(),
+        y,
+        sm3,
+        secret: cipher,
+    }
+    .to_der()
+    .map_err(|e| Error)
+
+
+    let plain = decrypt(secret_scalar, mode, hasher, cipher)?;
 }
 
 fn decrypt(
@@ -93,13 +131,15 @@ fn decrypt(
     cipher: &mut [u8],
 ) -> Result<Vec<u8>> {
     let q = U256::from_be_hex(FieldElement::MODULUS);
-    let c1_len = q.bits() * 2 + 1;
+    let c1_len = (q.bits() + 7) / 8 * 2 + 1;
 
     let (c1, c) = cipher.split_at_mut(c1_len as usize);
     let encoded_c1 = EncodedPoint::from_bytes(c1).unwrap();
+
     // verify that point c1 satisfies the elliptic curve
     let mut c1_point = AffinePoint::from_encoded_point(&encoded_c1).unwrap();
-    let s = c1_point * Scalar::from_uint(U256::from_u32(FieldElement::S)).unwrap();
+
+    let s = c1_point * Scalar::reduce(U256::from_u32(FieldElement::S));
 
     if s.is_identity().into() {
         return Err(Error);
@@ -110,18 +150,21 @@ fn decrypt(
     let digest_size = hasher.output_size();
 
     let (c2, c3) = match mode {
-        Mode::C1C3C2 => c.split_at_mut(digest_size),
+        Mode::C1C3C2 => {
+            let (c3, c2) = c.split_at_mut(digest_size);
+            (c2, c3)
+        }
         Mode::C1C2C3 => c.split_at_mut(c.len() - digest_size),
     };
 
     kdf(hasher, c1_point, c2)?;
 
-    let mut c3_checked = Vec::with_capacity(digest_size);
+    let mut c3_checked = vec![0u8; digest_size];
     let encode_point = c1_point.to_encoded_point(false);
 
-    hasher.update(encode_point.x().unwrap());
+    hasher.update(&encode_point.x().unwrap());
     hasher.update(c2);
-    hasher.update(encode_point.x().unwrap());
+    hasher.update(&encode_point.y().unwrap());
     hasher
         .finalize_into_reset(&mut c3_checked)
         .map_err(|_e| Error)?;

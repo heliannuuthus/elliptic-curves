@@ -1,10 +1,12 @@
-use crate::pke::kdf;
+use crate::pke::{kdf, vec};
 use crate::{AffinePoint, Scalar};
 use crate::{ProjectivePoint, PublicKey, Sm2};
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+
+#[cfg(feature = "alloc")]
+use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
+
 use elliptic_curve::group::GroupEncoding;
+use elliptic_curve::pkcs8::der::{Encode, EncodeValue};
 use elliptic_curve::sec1::ToEncodedPoint;
 use elliptic_curve::{
     bigint::{RandomBits, Uint, Zero, U256},
@@ -16,7 +18,7 @@ use elliptic_curve::{Error, Result};
 use sm3::digest::{Digest, DynDigest};
 use sm3::Sm3;
 
-use super::Mode;
+use super::{Cipher, Mode};
 
 pub struct EncryptingKey {
     public_key: PublicKey,
@@ -89,6 +91,31 @@ impl From<PublicKey> for EncryptingKey {
     }
 }
 
+fn encrypt_asna1(
+    public_key: PublicKey,
+    mode: Mode,
+    hasher: &mut dyn DynDigest,
+    msg: &[u8],
+) -> Result<Vec<u8>> {
+    let digest_size = hasher.output_size();
+
+    let mut cipher = encrypt(public_key, mode, hasher, msg)?;
+    let (x, cipher) = cipher.split_at(32);
+    let (y, cipher) = cipher.split_at(32);
+    let (sm3, cipher) = match mode {
+        Mode::C1C2C3 => cipher.split_at(digest_size),
+        Mode::C1C3C2 => cipher.split_at(cipher.len() - digest_size),
+    };
+    Cipher {
+        x: x.into(),
+        y,
+        sm3,
+        secret: cipher,
+    }
+    .to_der()
+    .map_err(|e| Error)
+}
+
 fn encrypt(
     public_key: PublicKey,
     mode: Mode,
@@ -96,13 +123,14 @@ fn encrypt(
     msg: &[u8],
 ) -> Result<Vec<u8>> {
     const N_BYTES: u32 = (Sm2::ORDER.bits() + 7) / 8;
-    let mut c1;
+    let mut c1 = vec![0; (N_BYTES * 2 + 1) as usize];
     let mut c2 = msg.to_owned();
     let mut kpb: AffinePoint;
     loop {
         let k = Scalar::from_uint(next_k(N_BYTES)).unwrap();
         let kg = ProjectivePoint::mul_by_generator(&k).to_affine();
-        c1 = kg.to_bytes();
+        let uncompress_kg = kg.to_encoded_point(false);
+        c1.copy_from_slice(uncompress_kg.as_bytes());
         let public_pp = public_key.to_projective();
         kpb = (public_pp * &k).to_affine();
         kdf(hasher, kpb, &mut c2)?;
@@ -115,29 +143,16 @@ fn encrypt(
     }
     let encode_point = kpb.to_encoded_point(false);
 
-    let mut c3 = Vec::with_capacity(hasher.output_size());
+    let mut c3 = vec![0; hasher.output_size()];
     hasher.update(encode_point.x().unwrap());
     hasher.update(msg);
-    hasher.update(encode_point.x().unwrap());
+    hasher.update(encode_point.y().unwrap());
+    hasher.finalize_into_reset(&mut c3).map_err(|_e| Error)?;
 
-    hasher
-        .finalize_into_reset(&mut c3)
-        .map_err(|_e| elliptic_curve::Error)?;
-
-    let mut result = Vec::with_capacity(c1.len() + c2.len() + c3.len());
-    match mode {
-        Mode::C1C2C3 => {
-            result.extend_from_slice(c1.as_slice());
-            result.extend_from_slice(&c2);
-            result.extend_from_slice(&c3);
-        }
-        Mode::C1C3C2 => {
-            result.extend_from_slice(c1.as_slice());
-            result.extend_from_slice(&c3);
-            result.extend_from_slice(&c2);
-        }
-    }
-    Ok(result)
+    Ok(match mode {
+        Mode::C1C2C3 => [c1.as_slice(), &c2, &c3].concat().to_vec(),
+        Mode::C1C3C2 => [c1.as_slice(), &c3, &c2].concat().to_vec(),
+    })
 }
 
 fn next_k(bit_length: u32) -> Uint<4> {
