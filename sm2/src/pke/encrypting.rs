@@ -1,3 +1,5 @@
+use core::fmt::Debug;
+
 use crate::pke::{kdf, vec};
 use crate::{AffinePoint, Scalar};
 use crate::{ProjectivePoint, PublicKey, Sm2};
@@ -5,8 +7,7 @@ use crate::{ProjectivePoint, PublicKey, Sm2};
 #[cfg(feature = "alloc")]
 use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
-use elliptic_curve::group::GroupEncoding;
-use elliptic_curve::pkcs8::der::{Encode, EncodeValue};
+use elliptic_curve::pkcs8::der::Encode;
 use elliptic_curve::sec1::ToEncodedPoint;
 use elliptic_curve::{
     bigint::{RandomBits, Uint, Zero, U256},
@@ -20,10 +21,10 @@ use sm3::Sm3;
 
 use super::{Cipher, Mode};
 
+#[derive(Clone, Debug)]
 pub struct EncryptingKey {
     public_key: PublicKey,
     mode: Mode,
-    digest: Box<dyn DynDigest + Send + Sync>,
 }
 
 impl EncryptingKey {
@@ -34,19 +35,7 @@ impl EncryptingKey {
 
     /// Initialize [`EncryptingKey`] from PublicKey and set Encryption mode
     pub fn new_with_mode(public_key: PublicKey, mode: Mode) -> Self {
-        Self::new_with_mode_and_hash::<Sm3>(public_key, mode)
-    }
-
-    /// Initialize [`EncryptingKey`] from PublicKey and set Encryption mode then set hasher
-    pub fn new_with_mode_and_hash<D: 'static + Digest + DynDigest + Send + Sync>(
-        public_key: PublicKey,
-        mode: Mode,
-    ) -> Self {
-        Self {
-            public_key,
-            mode,
-            digest: Box::new(D::new()),
-        }
+        Self { public_key, mode }
     }
 
     /// Initialize [`VerifyingKey`] from a SEC1-encoded public key.
@@ -80,8 +69,47 @@ impl EncryptingKey {
         self.public_key.to_sec1_bytes()
     }
 
-    pub fn encrypt(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
-        encrypt(self.public_key, self.mode, &mut *self.digest, msg)
+    pub fn encrypt(&self, msg: &[u8]) -> Result<Vec<u8>> {
+        self.encrypt_digest::<Sm3>(msg)
+    }
+
+    pub fn encrypt_asna1(&self, msg: &[u8]) -> Result<Vec<u8>> {
+        self.encrypt_asna1_digest::<Sm3>(msg)
+    }
+
+    pub fn encrypt_digest<D>(&self, msg: &[u8]) -> Result<Vec<u8>>
+    where
+        D: 'static + Digest + DynDigest + Send + Sync,
+    {
+        let mut digest = D::new();
+        encrypt(&self.public_key, self.mode, &mut digest, msg)
+    }
+
+    pub fn encrypt_asna1_digest<D>(&self, msg: &[u8]) -> Result<Vec<u8>>
+    where
+        D: 'static + Digest + DynDigest + Send + Sync,
+    {
+        let mut digest = D::new();
+        let cipher = encrypt(&self.public_key, self.mode, &mut digest, msg)?;
+        let digest_size = digest.output_size();
+        let (_, cipher) = cipher.split_at(1);
+        let (x, cipher) = cipher.split_at(32);
+        let (y, cipher) = cipher.split_at(32);
+        let (digest, cipher) = match self.mode {
+            Mode::C1C2C3 => {
+                let (cipher, digest) = cipher.split_at(cipher.len() - digest_size);
+                (digest, cipher)
+            }
+            Mode::C1C3C2 => cipher.split_at(digest_size),
+        };
+        Ok(Cipher {
+            x,
+            y,
+            digest,
+            cipher,
+        }
+        .to_der()
+        .map_err(|e| elliptic_curve::pkcs8::Error::from(e))?)
     }
 }
 
@@ -91,35 +119,10 @@ impl From<PublicKey> for EncryptingKey {
     }
 }
 
-fn encrypt_asna1(
-    public_key: PublicKey,
-    mode: Mode,
-    hasher: &mut dyn DynDigest,
-    msg: &[u8],
-) -> Result<Vec<u8>> {
-    let digest_size = hasher.output_size();
-
-    let mut cipher = encrypt(public_key, mode, hasher, msg)?;
-    let (x, cipher) = cipher.split_at(32);
-    let (y, cipher) = cipher.split_at(32);
-    let (sm3, cipher) = match mode {
-        Mode::C1C2C3 => cipher.split_at(digest_size),
-        Mode::C1C3C2 => cipher.split_at(cipher.len() - digest_size),
-    };
-    Cipher {
-        x: x.into(),
-        y,
-        sm3,
-        secret: cipher,
-    }
-    .to_der()
-    .map_err(|e| Error)
-}
-
 fn encrypt(
-    public_key: PublicKey,
+    public_key: &PublicKey,
     mode: Mode,
-    hasher: &mut dyn DynDigest,
+    digest: &mut dyn DynDigest,
     msg: &[u8],
 ) -> Result<Vec<u8>> {
     const N_BYTES: u32 = (Sm2::ORDER.bits() + 7) / 8;
@@ -133,7 +136,8 @@ fn encrypt(
         c1.copy_from_slice(uncompress_kg.as_bytes());
         let public_pp = public_key.to_projective();
         kpb = (public_pp * &k).to_affine();
-        kdf(hasher, kpb, &mut c2)?;
+
+        kdf(digest, kpb, &mut c2)?;
 
         // if all of t are 0, xor(c2) == c2
 
@@ -143,11 +147,11 @@ fn encrypt(
     }
     let encode_point = kpb.to_encoded_point(false);
 
-    let mut c3 = vec![0; hasher.output_size()];
-    hasher.update(encode_point.x().unwrap());
-    hasher.update(msg);
-    hasher.update(encode_point.y().unwrap());
-    hasher.finalize_into_reset(&mut c3).map_err(|_e| Error)?;
+    let mut c3 = vec![0; digest.output_size()];
+    digest.update(encode_point.x().unwrap());
+    digest.update(msg);
+    digest.update(encode_point.y().unwrap());
+    digest.finalize_into_reset(&mut c3).map_err(|_e| Error)?;
 
     Ok(match mode {
         Mode::C1C2C3 => [c1.as_slice(), &c2, &c3].concat().to_vec(),
@@ -156,10 +160,9 @@ fn encrypt(
 }
 
 fn next_k(bit_length: u32) -> Uint<4> {
-    let mut k: Uint<4>;
     loop {
-        k = U256::random_bits(&mut rand_core::OsRng, bit_length);
-        if !(k == U256::zero() || k > Sm2::ORDER) {
+        let k = U256::random_bits(&mut rand_core::OsRng, bit_length);
+        if k.is_zero().unwrap_u8() == 0 && k <= Sm2::ORDER {
             return k;
         }
     }

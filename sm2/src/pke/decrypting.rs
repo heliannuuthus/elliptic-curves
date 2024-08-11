@@ -1,50 +1,43 @@
+use core::fmt::{self, Debug};
+
 use crate::arithmetic::field::FieldElement;
 use crate::{AffinePoint, EncodedPoint, FieldBytes, NonZeroScalar, PublicKey, Scalar, SecretKey};
-use alloc::boxed::Box;
+
 use alloc::vec::Vec;
 use elliptic_curve::ops::Reduce;
+use elliptic_curve::pkcs8::der::Decode;
 use elliptic_curve::sec1::FromEncodedPoint;
+use elliptic_curve::subtle::{Choice, ConstantTimeEq};
 use elliptic_curve::Error;
-use elliptic_curve::{
-    bigint::U256,
-    sec1::{ToEncodedPoint, UncompressedPoint},
-    Group, Result,
-};
+use elliptic_curve::{bigint::U256, sec1::ToEncodedPoint, Group, Result};
 use primeorder::PrimeField;
+
 use sm3::digest::DynDigest;
 use sm3::{Digest, Sm3};
 
 use super::encrypting::EncryptingKey;
 use super::{kdf, vec, Cipher, Mode};
 
+#[derive(Clone)]
 pub struct DecryptingKey {
     secret_scalar: NonZeroScalar,
-    encrytingKey: EncryptingKey,
+    encryting_key: EncryptingKey,
     mode: Mode,
-    digest: Box<dyn DynDigest + Send + Sync>,
 }
 
 impl DecryptingKey {
     pub fn new(secret_key: SecretKey) -> Self {
-        Self::new_with_mode(secret_key.to_nonzero_scalar(), Mode::C1C2C3)
+        Self::new_with_mode(secret_key.to_nonzero_scalar(), Mode::C1C3C2)
     }
 
     pub fn new_with_mode(secret_scalar: NonZeroScalar, mode: Mode) -> Self {
-        Self::new_with_mode_and_hash::<Sm3>(secret_scalar, mode)
-    }
-
-    pub fn new_with_mode_and_hash<D: 'static + Digest + DynDigest + Send + Sync>(
-        secret_scalar: NonZeroScalar,
-        mode: Mode,
-    ) -> Self {
         Self {
             secret_scalar,
-            encrytingKey: EncryptingKey::new_with_mode_and_hash::<D>(
+            encryting_key: EncryptingKey::new_with_mode(
                 PublicKey::from_secret_scalar(&secret_scalar),
                 mode,
             ),
             mode,
-            digest: Box::new(D::new()),
         }
     }
 
@@ -62,7 +55,7 @@ impl DecryptingKey {
 
     /// Create a signing key from a non-zero scalar.
     pub fn from_nonzero_scalar(secret_scalar: NonZeroScalar) -> Result<Self> {
-        Ok(Self::new_with_mode(secret_scalar, Mode::C1C2C3))
+        Ok(Self::new_with_mode(secret_scalar, Mode::C1C3C2))
     }
 
     /// Serialize as bytes.
@@ -81,47 +74,76 @@ impl DecryptingKey {
         &self.secret_scalar
     }
 
-    /// Get the [`VerifyingKey`] which corresponds to this [`SigningKey`].
+    /// Get the [`EncryptingKey`] which corresponds to this [`DecryptingKey`].
     pub fn encrypting_key(&self) -> &EncryptingKey {
-        &self.encrytingKey
+        &self.encryting_key
     }
 
     /// Decrypt inplace
-    pub fn decrypt(&mut self, ciphertext: &mut [u8]) -> Result<Vec<u8>> {
-        decrypt(
-            &self.secret_scalar,
-            self.mode,
-            &mut *self.digest,
-            ciphertext,
-        )
+    pub fn decrypt(&self, ciphertext: &mut [u8]) -> Result<Vec<u8>> {
+        self.decrypt_digest::<Sm3>(ciphertext)
+    }
+    /// Decrypt inplace
+    pub fn decrypt_digest<D>(&self, ciphertext: &mut [u8]) -> Result<Vec<u8>>
+    where
+        D: 'static + Digest + DynDigest + Send + Sync,
+    {
+        let mut digest = D::new();
+        decrypt(&self.secret_scalar, self.mode, &mut digest, ciphertext)
+    }
+
+    pub fn decrypt_asna1(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_asna1_digest::<Sm3>(ciphertext)
+    }
+
+    /// Decrypt inplace
+    pub fn decrypt_asna1_digest<D>(&self, ciphertext: &[u8]) -> Result<Vec<u8>>
+    where
+        D: 'static + Digest + DynDigest + Send + Sync,
+    {
+        let cipher =
+            Cipher::from_der(&ciphertext).map_err(|e| elliptic_curve::pkcs8::Error::from(e))?;
+
+        let mut cipher = match self.mode {
+            Mode::C1C2C3 => [&[0x04], cipher.x, cipher.y, cipher.cipher, cipher.digest].concat(),
+            Mode::C1C3C2 => [&[0x04], cipher.x, cipher.y, cipher.digest, cipher.cipher].concat(),
+        };
+
+        Ok(self.decrypt_digest::<D>(&mut cipher)?)
     }
 }
 
-fn decrypt_asna1(
-    secret_scalar: &Scalar,
-    mode: Mode,
-    hasher: &mut dyn DynDigest,
-    cipher: &mut [u8],
-) -> Result<Vec<u8>> {
-    
-    let digest_size = hasher.output_size();
-    let (x, cipher) = cipher.split_at(32);
-    let (y, cipher) = cipher.split_at(32);
-    let (sm3, cipher) = match mode {
-        Mode::C1C2C3 => cipher.split_at(digest_size),
-        Mode::C1C3C2 => cipher.split_at(cipher.len() - digest_size),
-    };
-    Cipher {
-        x: x.into(),
-        y,
-        sm3,
-        secret: cipher,
+//
+// Other trait impls
+//
+
+impl AsRef<EncryptingKey> for DecryptingKey {
+    fn as_ref(&self) -> &EncryptingKey {
+        &self.encryting_key
     }
-    .to_der()
-    .map_err(|e| Error)
+}
 
+impl ConstantTimeEq for DecryptingKey {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.secret_scalar.ct_eq(&other.secret_scalar)
+    }
+}
 
-    let plain = decrypt(secret_scalar, mode, hasher, cipher)?;
+impl Debug for DecryptingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecryptingKey")
+            .field("private_key", &self.secret_scalar.as_ref())
+            .field("encrypting_key", &self.encrypting_key())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Constant-time comparison
+impl Eq for DecryptingKey {}
+impl PartialEq for DecryptingKey {
+    fn eq(&self, other: &DecryptingKey) -> bool {
+        self.ct_eq(other).into()
+    }
 }
 
 fn decrypt(
